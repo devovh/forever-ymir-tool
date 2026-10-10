@@ -35,7 +35,11 @@ namespace YmirTool
         // 2. record
         Label recordHelp, checklistTitle, recordingsTitle, recordState;
         Label[] checkName = new Label[3], checkState = new Label[3];
-        CheckBox clearCache;
+        CheckBox clearCache, strict;
+        Label recorderLabel;
+        RadioButton useYmir, useSniffer;
+        TextBox snifferPath;
+        Button browseSniffer;
         Button startYmir, stopYmir, openDumps, openRecording;
         ListView recordings;
         List<Recording> recordingList = new List<Recording>();
@@ -129,10 +133,22 @@ namespace YmirTool
             tPatch.Controls.Add(p);
 
             // --- 2. record
-            var r = Stack(7);
-            for (int i = 0; i < 6; i++) r.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            var r = Stack(8);
+            for (int i = 0; i < 7; i++) r.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             r.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             recordHelp = Help();
+            // recorder: Ymir (made in tab 1) or Forever Sniffer (ours: any client build; its location can be chosen)
+            var recRow = Row();
+            recorderLabel = Text_(true);
+            useYmir = new RadioButton { AutoSize = true, Text = "Ymir", Margin = new Padding(0, 5, 12, 0) };
+            useSniffer = new RadioButton { AutoSize = true, Margin = new Padding(0, 5, 12, 0) };
+            (Settings.Get("recorder", "ymir") == "sniffer" ? useSniffer : useYmir).Checked = true;
+            useSniffer.CheckedChanged += (s, e) => { Settings.Set("recorder", useSniffer.Checked ? "sniffer" : "ymir"); RecorderChanged(); };
+            snifferPath = new TextBox { Width = 420, ReadOnly = true, Margin = new Padding(0, 3, 8, 0), Text = DefaultSniffer() };
+            browseSniffer = Btn(); browseSniffer.Click += (s, e) => PickSniffer();
+            strict = new CheckBox { AutoSize = true, Margin = new Padding(0, 6, 0, 0), Checked = Settings.Get("strict", "0") == "1" };
+            strict.CheckedChanged += (s, e) => Settings.Set("strict", strict.Checked ? "1" : "0");
+            recRow.Controls.AddRange(new Control[] { recorderLabel, useYmir, useSniffer, snifferPath, browseSniffer, strict });
             checklistTitle = Text_(true);
             var checks = new TableLayoutPanel { AutoSize = true, ColumnCount = 2, Dock = DockStyle.Fill, Margin = new Padding(10, 0, 0, 6) };
             checks.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -158,8 +174,8 @@ namespace YmirTool
             recordings = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, Font = Mono, HideSelection = false };
             foreach (var w in new[] { 160, 80, 110, 520 }) recordings.Columns.Add("", w);
             recordings.DoubleClick += (s, e) => OpenSelectedRecording();
-            r.Controls.Add(recordHelp, 0, 0); r.Controls.Add(checklistTitle, 0, 1); r.Controls.Add(checks, 0, 2);
-            r.Controls.Add(controls, 0, 3); r.Controls.Add(recordState, 0, 4); r.Controls.Add(recHead, 0, 5); r.Controls.Add(recordings, 0, 6);
+            r.Controls.Add(recordHelp, 0, 0); r.Controls.Add(recRow, 0, 1); r.Controls.Add(checklistTitle, 0, 2); r.Controls.Add(checks, 0, 3);
+            r.Controls.Add(controls, 0, 4); r.Controls.Add(recordState, 0, 5); r.Controls.Add(recHead, 0, 6); r.Controls.Add(recordings, 0, 7);
             tRecord.Controls.Add(r);
 
             // --- 3. viewer
@@ -235,6 +251,8 @@ namespace YmirTool
             find.Text = L.Get("find"); create.Text = L.Get("create"); openFolder.Text = L.Get("openfolder");
             Columns(addresses, "col.address", "col.original", "col.new", "col.method", "col.check");
             checklistTitle.Text = L.Get("checklist"); clearCache.Text = L.Get("clearcache");
+            recorderLabel.Text = L.Get("recorder"); useSniffer.Text = L.Get("rec.sniffer"); browseSniffer.Text = L.Get("browse"); strict.Text = L.Get("strict");
+            snifferPath.Enabled = browseSniffer.Enabled = strict.Enabled = useSniffer.Checked;
             startYmir.Text = L.Get("start"); stopYmir.Text = L.Get("stop"); openDumps.Text = L.Get("opendumps");
             recordingsTitle.Text = L.Get("recordings"); openRecording.Text = L.Get("openrec");
             Columns(recordings, "col.date", "col.build", "col.size", "col.file");
@@ -280,7 +298,40 @@ namespace YmirTool
         }
 
         string YmirFolder() { return File.Exists(ymirPath.Text) ? Path.GetDirectoryName(ymirPath.Text) : null; }
-        string DumpsFolder() { var f = YmirFolder(); return f == null ? null : Path.Combine(f, "dumps"); }
+        // the chosen recorder's folder (its dumps folder is where the sniffs go)
+        string RecordFolder() { return useSniffer.Checked ? (SnifferExe() != null ? Path.GetDirectoryName(SnifferExe()) : null) : YmirFolder(); }
+        string DumpsFolder() { var f = RecordFolder(); return f == null ? null : Path.Combine(f, "dumps"); }
+        string RecorderProcess() { return useSniffer.Checked ? "ForeverSniffer" : "regedit"; }
+        string SnifferExe() { return File.Exists(snifferPath.Text) ? snifferPath.Text : null; }
+
+        // the remembered location, else ForeverSniffer.exe next to this tool
+        static string DefaultSniffer()
+        {
+            string saved = Settings.Get("sniffer", "");
+            if (File.Exists(saved)) return saved;
+            string next = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ForeverSniffer.exe");
+            return File.Exists(next) ? next : "";
+        }
+
+        void PickSniffer()
+        {
+            using (var dlg = new OpenFileDialog { Filter = "Forever Sniffer (ForeverSniffer.exe)|ForeverSniffer.exe|*.exe|*.exe", Title = L.Get("pick.sniffer") })
+            {
+                if (SnifferExe() != null) dlg.InitialDirectory = Path.GetDirectoryName(SnifferExe());
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                snifferPath.Text = dlg.FileName;
+                Settings.Set("sniffer", dlg.FileName);
+                RecorderChanged();
+            }
+        }
+
+        void RecorderChanged()
+        {
+            snifferPath.Enabled = browseSniffer.Enabled = strict.Enabled = useSniffer.Checked;
+            UpdateChecklist();
+            RefreshRecordings();
+            UpdateRecordState();
+        }
 
         void OnTimer()
         {
@@ -442,6 +493,15 @@ namespace YmirTool
         {
             string npcap = YmirRunner.NpcapProblem();
             SetCheck(0, L.Get("chk.npcap"), npcap == null, npcap == null ? L.Get("ok.npcap") : npcap);
+            if (useSniffer.Checked)
+            {
+                // Forever Sniffer: listens on every adapter unless interface.cfg names one; works with any client build
+                string exe = SnifferExe();
+                string cfg = exe == null ? null : YmirRunner.Adapter(Path.GetDirectoryName(exe));
+                SetCheck(1, L.Get("chk.adapter"), true, cfg ?? L.Get("sniffer.adapter"));
+                SetCheck(2, L.Get("pick.sniffer"), exe != null, exe ?? L.Get("no.sniffer"));
+                return;
+            }
             string folder = YmirFolder();
             string adapter = folder == null ? null : YmirRunner.Adapter(folder);
             SetCheck(1, L.Get("chk.adapter"), adapter != null, adapter != null ? L.Get("ok.adapter") + ": " + adapter : L.Get("no.adapter"));
@@ -460,9 +520,10 @@ namespace YmirTool
 
         void UpdateRecordState()
         {
-            string folder = YmirFolder();
-            var running = folder == null ? new List<Process>() : YmirRunner.Running(folder);
-            startYmir.Enabled = running.Count == 0 && ymirForClient != null && YmirRunner.NpcapProblem() == null;
+            string folder = RecordFolder();
+            var running = folder == null ? new List<Process>() : YmirRunner.Running(folder, RecorderProcess());
+            bool ready = useSniffer.Checked ? SnifferExe() != null : ymirForClient != null;
+            startYmir.Enabled = running.Count == 0 && ready && YmirRunner.NpcapProblem() == null;
             stopYmir.Enabled = running.Count > 0;
             if (running.Count == 0) { recordState.Text = L.Get("state.off"); recordState.ForeColor = Dim; lastDumpSize = 0; return; }
             var newest = YmirRunner.Recordings(folder).FirstOrDefault();
@@ -481,14 +542,15 @@ namespace YmirTool
             try
             {
                 UpdateChecklist();
-                if (ymirForClient == null) return;
+                if (useSniffer.Checked ? SnifferExe() == null : ymirForClient == null) return;
                 if (clearCache.Checked)
                 {
                     string cache = YmirRunner.CacheFolder(Settings.GameExe());
                     if (LiveImage.FindClient() != null) Say(L.Get("cache.gamerunning"), Warn);
                     else if (cache != null && Directory.Exists(cache)) { Directory.Delete(cache, true); Say(L.Get("cache.deleted", cache), Dim); }
                 }
-                YmirRunner.Start(ymirForClient);
+                if (useSniffer.Checked) YmirRunner.Start(SnifferExe(), strict.Checked ? "--strict" : "");
+                else YmirRunner.Start(ymirForClient);
                 Say(L.Get("started"), Good);
             }
             catch (Exception ex) { Say(ex.Message, Bad); }
@@ -497,7 +559,8 @@ namespace YmirTool
 
         async void StopYmir()
         {
-            var running = YmirRunner.Running(YmirFolder());
+            string folder = RecordFolder();
+            var running = folder == null ? new List<Process>() : YmirRunner.Running(folder, RecorderProcess());
             if (running.Count == 0) return;
             stopYmir.Enabled = false;
             bool ok = await Task.Run(() => running.All(p => YmirRunner.Stop(p, 10000)));
@@ -507,7 +570,7 @@ namespace YmirTool
 
         void RefreshRecordings()
         {
-            string folder = YmirFolder();
+            string folder = RecordFolder();
             var list = folder == null ? new List<Recording>() : YmirRunner.Recordings(folder);
             bool same = list.Count == recordingList.Count && list.Zip(recordingList, (a, b) => a.Path == b.Path && a.Size == b.Size).All(x => x);
             if (same) return;

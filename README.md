@@ -24,6 +24,11 @@ addresses inside the new `WowB.exe`. This tab finds them and writes `regedit_<bu
 
 ## 2. Record
 
+**Recorder:** choose **Ymir** (the copy made in tab 1 for your client build) or **Forever Sniffer**, our own sniffer
+(`sniffer/`, works with any client build without patching). For Forever Sniffer, **Browse** picks where `ForeverSniffer.exe`
+is (by default the one next to `YmirTool.exe`); the sniffs go to the `dumps` folder next to it. **Close the game if the recording
+goes wrong** starts it with `--strict` (like Ymir's own safety stop).
+
 A checklist shows what Ymir needs, each with a ✔ or ✖:
 
 | Item | If it is ✖ |

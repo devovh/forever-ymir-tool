@@ -62,13 +62,14 @@ namespace YmirTool
             catch { return null; }
         }
 
-        public static List<Process> Running(string folder)
+        // the recorders running from this folder: Ymir (regedit*.exe) or Forever Sniffer (ForeverSniffer.exe)
+        public static List<Process> Running(string folder, string processName = "regedit")
         {
             var list = new List<Process>();
             string full = System.IO.Path.GetFullPath(folder).TrimEnd('\\') + "\\";
             foreach (var p in Process.GetProcesses())
             {
-                if (!p.ProcessName.StartsWith("regedit", StringComparison.OrdinalIgnoreCase)) continue;
+                if (!p.ProcessName.StartsWith(processName, StringComparison.OrdinalIgnoreCase)) continue;
                 try
                 {
                     if (p.MainModule.FileName.StartsWith(full, StringComparison.OrdinalIgnoreCase)) list.Add(p);
@@ -78,9 +79,9 @@ namespace YmirTool
             return list;
         }
 
-        public static Process Start(string ymir)
+        public static Process Start(string exe, string arguments = "")
         {
-            return Process.Start(new ProcessStartInfo(ymir) { WorkingDirectory = System.IO.Path.GetDirectoryName(ymir), UseShellExecute = true });
+            return Process.Start(new ProcessStartInfo(exe, arguments) { WorkingDirectory = System.IO.Path.GetDirectoryName(exe), UseShellExecute = true });
         }
 
         [DllImport("kernel32.dll", SetLastError = true)] static extern bool AttachConsole(uint pid);
@@ -88,7 +89,7 @@ namespace YmirTool
         [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetConsoleCtrlHandler(IntPtr handler, bool add);
         [DllImport("kernel32.dll", SetLastError = true)] static extern bool GenerateConsoleCtrlEvent(uint ctrlEvent, uint group);
 
-        // Ctrl+C into Ymir's console; true if it ended within the time
+        // Ctrl+C into the recorder's console (Ymir and Forever Sniffer both save the sniff on it); true if it ended within the time
         public static bool Stop(Process p, int waitMs)
         {
             FreeConsole();
