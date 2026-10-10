@@ -1,5 +1,5 @@
 // Makes a copy of Ymir (the Forever beta build 70124, regedit.exe) for another client build: the build number in five places and
-// the three WowB.exe addresses (same as classic_re/ymir_patch/patch_ymir.py). Each patched value sits inside one instruction whose
+// the three WowB.exe addresses (same as classic_re/ymir_patch/patch_ymir.py), and from client 70291 on nine opcode constants. Each patched value sits inside one instruction whose
 // exact bytes are known; a file whose bytes differ anywhere in those instructions is refused. The original is never changed.
 using System;
 using System.IO;
@@ -15,9 +15,10 @@ namespace YmirTool
         public readonly byte[] Original;        // the whole instruction in the 70124 Ymir
         public readonly int ValueAt;            // where the 4-byte value starts in it
         public readonly string Text;
-        public Spot(long fileOffset, string kind, string hex, int valueAt, string text)
+        public readonly uint NewOpcode;         // Kind "opcode": the value for client 70291 and later
+        public Spot(long fileOffset, string kind, string hex, int valueAt, string text, uint newOpcode = 0)
         {
-            FileOffset = fileOffset; Kind = kind; ValueAt = valueAt; Text = text;
+            FileOffset = fileOffset; Kind = kind; ValueAt = valueAt; Text = text; NewOpcode = newOpcode;
             Original = Enumerable.Range(0, hex.Length / 2).Select(i => Convert.ToByte(hex.Substring(i * 2, 2), 16)).ToArray();
         }
     }
@@ -37,6 +38,18 @@ namespace YmirTool
             new Spot(0x11c206, "locale_index", "4881C2C40BFA05", 3, "add rdx, locale index"),
             new Spot(0x11c222, "locale_table", "488D940AC0F39604", 4, "lea rdx, [rdx+rcx+locale table]"),
             new Spot(0x11e2a0, "session", "4881C208E1FF05", 3, "add rdx, session key object"),
+            // Client 70291 inserted a message group before the connection groups: server connection 0x4D -> 0x4E, client connection
+            // 0x45 -> 0x46, server main group 0x46 -> 0x47 with one more message from about index 0x1B6 on (verified 2026-10-09 on
+            // the official handshake: AUTH_CHALLENGE 0x4E0000, AUTH_SESSION 0x460001, COMPRESSED_PACKET 0x4E000E)
+            new Spot(0x11e989, "opcode", "81F90E004D00", 2, "cmp ecx, SMSG_COMPRESSED_PACKET", 0x4E000E),
+            new Spot(0x11e991, "opcode", "81F90D004D00", 2, "cmp ecx, SMSG_MULTIPLE_PACKETS", 0x4E000D),
+            new Spot(0x11ebc2, "opcode", "81FF08004D00", 2, "cmp edi, SMSG_CONNECT_TO", 0x4E0008),
+            new Spot(0x11eff6, "opcode", "81FF00004D00", 2, "cmp edi, SMSG_AUTH_CHALLENGE", 0x4E0000),
+            new Spot(0x11f037, "opcode", "81C7FCFFB2FF", 2, "add edi, -SMSG_ENTER_ENCRYPTED_MODE (switch 0x4D0004..8)", 0xFFB1FFFC),
+            new Spot(0x11f261, "opcode", "81FF0C004600", 2, "cmp edi, main group 0x0C", 0x47000C),
+            new Spot(0x11f26d, "opcode", "81FFF1014600", 2, "cmp edi, main group 0x1F1", 0x4701F2),
+            new Spot(0x11f87a, "opcode", "8D8F0000BBFF", 2, "lea ecx, [rdi - client connection group]", 0xFFBA0000),
+            new Spot(0x11f96b, "opcode", "81FF0C004600", 2, "cmp edi, main group 0x0C", 0x47000C),
         };
 
         public static string Sha256(byte[] data)
@@ -64,7 +77,9 @@ namespace YmirTool
             var d = (byte[])source.Clone();
             foreach (var s in Spots)
             {
-                long value = s.Kind == "build" ? build : a.Get(s.Kind);
+                if (s.Kind == "opcode" && build < 70291)
+                    continue;
+                long value = s.Kind == "opcode" ? s.NewOpcode : s.Kind == "build" ? build : a.Get(s.Kind);
                 Array.Copy(BitConverter.GetBytes((uint)value), 0, d, s.FileOffset + s.ValueAt, 4);
             }
             // like patch_ymir.py: the old build number must be gone completely

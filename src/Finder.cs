@@ -48,6 +48,7 @@ namespace YmirTool
             new BuildAddresses { Build = 70205, LocaleIndex = 0x5ef5804, LocaleTable = 0x48d53c0, Session = 0x5f52d08 },
             new BuildAddresses { Build = 70235, LocaleIndex = 0x5f06fc4, LocaleTable = 0x48e33c0, Session = 0x5f644d8 },
             new BuildAddresses { Build = 70245, LocaleIndex = 0x5f08004, LocaleTable = 0x48e43c0, Session = 0x5f65518 },
+            new BuildAddresses { Build = 70291, LocaleIndex = 0x5f9fbd4, LocaleTable = 0x497a440, Session = 0x5ffd0f8 },
         };
 
         // ------------------------------------------------------------------ builds learned by this tool (%APPDATA%\YmirTool)
@@ -196,6 +197,7 @@ namespace YmirTool
             chosen = candidates.Where(c => c.Score >= best - 6 && c.Detail == "session key present")
                                .OrderBy(c => Math.Abs(c.Rva - predicted)).FirstOrDefault()
                   ?? ScanForSessionKey(img, predicted)
+                  ?? ScanFromEveryBuild(img, result["locale_table"], predicted)
                   ?? candidates.Where(c => c.Score >= best - 6).OrderBy(c => Math.Abs(c.Rva - predicted)).First();
 
             // near the prediction with a live key: confirmed even if the fingerprint score alone is not decisive
@@ -228,6 +230,23 @@ namespace YmirTool
                     if (p >= 0x10000000000L && p < 0x7ff000000000L && ReadSessionKey(img, p).Distinct().Count() >= SessionKeyMinDistinct)
                         return new FoundAddress { Key = "session", Rva = rva, Check = CheckState.Ok, Detail = "session key present" };
                 }
+            }
+            return null;
+        }
+
+        // a build can sit closer to an older layout than to the nearest build number (70291 is 0x1000 below 70124, not near 70245):
+        // predict the session from every known build's locale_table -> session distance and look around each
+        static FoundAddress ScanFromEveryBuild(GameImage img, FoundAddress localeTable, long tried)
+        {
+            if (localeTable.Check != CheckState.Ok)
+                return null;
+            foreach (var b in AllBuilds().Select(b => b.Session + localeTable.Rva - b.LocaleTable).Distinct().OrderBy(p => Math.Abs(p - tried)))
+            {
+                if (Math.Abs(b - tried) <= 0x400)
+                    continue;
+                var f = ScanForSessionKey(img, b);
+                if (f != null)
+                    return f;
             }
             return null;
         }
