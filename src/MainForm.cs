@@ -416,6 +416,13 @@ namespace YmirTool
             {
                 fromKnownBuild = true;
                 found = Finder.Keys.ToDictionary(k => k, k => new FoundAddress { Key = k, Rva = known.Get(k), Check = CheckState.Ok, Detail = L.Get("method.known") });
+                // the locale addresses are static in the image, so a known build can show them without the game;
+                // the session slot is only meaningful while the client runs, and only a sniff can confirm it
+                if (p == null)
+                {
+                    found["session"].Check = CheckState.Unconfirmed;
+                    found["session"].Detail = L.Get("method.known") + ", start the game to confirm";
+                }
                 Log(L.Get("known", clientBuild));
                 ShowAddresses();
             }
@@ -528,8 +535,10 @@ namespace YmirTool
                            && YmirPatcher.CheckTarget(File.ReadAllBytes(ymirPath.Text), clientBuild) == null;
             }
             catch { targetOk = false; }
-            // a failed search leaves Rva = 0 or a stretch of code: never offer to write those numbers into a copy of Ymir
-            bool foundOk = found != null && found.Values.All(f => f.Check == CheckState.Ok && f.Rva != 0);
+            // Ymir needs three addresses, not three confirmations: a failed search leaves Rva = 0 or a stretch of code,
+            // which is what must never reach a copy of Ymir. Unconfirmed means "from the build table, not checked in this
+            // session" - the session slot can only be checked while the game runs, so it must not block patching.
+            bool foundOk = found != null && found.Values.All(f => f.Check != CheckState.Failed && f.Rva != 0);
             create.Enabled = targetOk && foundOk && ymirState.ForeColor == Good;
         }
 
