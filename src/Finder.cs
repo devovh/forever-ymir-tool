@@ -49,6 +49,12 @@ namespace YmirTool
             new BuildAddresses { Build = 70235, LocaleIndex = 0x5f06fc4, LocaleTable = 0x48e33c0, Session = 0x5f644d8 },
             new BuildAddresses { Build = 70245, LocaleIndex = 0x5f08004, LocaleTable = 0x48e43c0, Session = 0x5f65518 },
             new BuildAddresses { Build = 70291, LocaleIndex = 0x5f9fbd4, LocaleTable = 0x497a440, Session = 0x5ffd0f8 },
+            // 70938 (Forever 1.60.1), all three from a dump of the running client:
+            //   locale_table 0x3c02710 - 11 locale pointers in a row (enUS koKR frFR deDE ...), verified 227/227
+            //   locale_index 0x483f908 - inside the locale record table at 0x483f900: [name pointer][index u32][flags u32]
+            //                              entries of 0x18 bytes; the enUS record's index is 0, which is what Ymir reads
+            //   session      0x4b69948 - ForeverSniffer: "pointer at image RVA 0x4b69948, key at +0x48"
+            new BuildAddresses { Build = 70938, LocaleIndex = 0x483f908, LocaleTable = 0x3c02710, Session = 0x4b69948 },
         };
 
         // ------------------------------------------------------------------ builds learned by this tool (%APPDATA%\YmirTool)
@@ -77,7 +83,57 @@ namespace YmirTool
             try { return File.ReadAllLines(LearnedFile); } catch { return new string[0]; }
         }
 
-        public static BuildAddresses Known(int build) { return AllBuilds().FirstOrDefault(b => b.Build == build); }
+        // A line that names the build but carries no addresses is a failed search that got saved anyway. Such a build used to
+        // be treated as known, and every later search reused the 0x0 instead of looking again.
+        public static bool IsUsable(BuildAddresses b)
+        {
+            return b != null && b.LocaleTable != 0 && b.LocaleIndex != 0 && b.Session != 0;
+        }
+
+        public static BuildAddresses Known(int build) { var b = AllBuilds().FirstOrDefault(x => x.Build == build); return IsUsable(b) ? b : null; }
+
+        // If the neighbouring anchors moved by the same amount, this client keeps the same layout and the addresses can simply be
+        // shifted. A search that drifted by tens of megabytes has not found anything - it is not a newer layout, and writing those
+        // numbers into a copy of Ymir would only produce a binary that crashes.
+        public static BuildAddresses Shifted(BuildAddresses from, long by)
+        {
+            if (from == null || by == 0) return null;
+            var b = new BuildAddresses
+            {
+                Build = 0,
+                LocaleTable = from.LocaleTable + by,
+                LocaleIndex = from.LocaleIndex + by,
+                Session = from.Session + by,
+            };
+            return IsUsable(b) ? b : null;
+        }
+
+        /// <summary>Every 8-byte aligned .data slot that holds a pointer into the image: (slot RVA, pointer value).</summary>
+        /// <remarks>The sniffer walks the same set to find the session object; here it lets the key be confirmed by crypto.</remarks>
+        public static List<KeyValuePair<long, long>> DataPointerSlots(GameImage img)
+        {
+            var slots = new List<KeyValuePair<long, long>>();
+            var seen = new HashSet<long>();
+            foreach (var s in img.Sections)
+            {
+                if (s.Name != ".data") continue;
+                const int chunk = 1 << 20;
+                for (long off = 0; off < s.Size; off += chunk)
+                {
+                    int n = (int)Math.Min(chunk, s.Size - off);
+                    var b = img.Read(s.Rva + off, n);
+                    if (b == null) continue;
+                    for (int i = 0; i + 8 <= b.Length; i += 8)
+                    {
+                        long v = BitConverter.ToInt64(b, i);
+                        if (v < img.Base || v >= img.Base + img.Size) continue;
+                        if (!seen.Add(v)) continue;
+                        slots.Add(new KeyValuePair<long, long>(s.Rva + off + i, v));
+                    }
+                }
+            }
+            return slots;
+        }
 
         // fingerprints: the newest learned ones, else the built-in ones (70205)
         static Dictionary<string, string> Fingerprints(out int fromBuild)
@@ -103,6 +159,13 @@ namespace YmirTool
 
         public static void Learn(GameImage img, int build, Dictionary<string, FoundAddress> found)
         {
+
+            // never save a failed search: a "build N 0 0 0" line makes N look known and its 0x0 stay forever
+            foreach (var key in Keys)
+            {
+                var f = found[key];
+                if (f.Check != CheckState.Ok || f.Rva == 0) return;
+            }
             Directory.CreateDirectory(DataDir);
             var lines = ReadLearned().Where(l => !l.StartsWith("build " + build + " ") && !l.StartsWith("fp " + build + " ")).ToList();
             lines.Add(string.Format("build {0} {1:x} {2:x} {3:x}", build, found["locale_table"].Rva, found["locale_index"].Rva, found["session"].Rva));
@@ -175,12 +238,98 @@ namespace YmirTool
         // so their shift predicts where the session object is. Of the close fingerprint matches for the session object, the one that
         // leads to a live session key wins (logged in), else the one nearest to the prediction (70245: fingerprint best 123 vs 121
         // picked a spot 0x1D000 away from the predicted one).
+        // ------------------------------------------------------------------ search by structure, not by fingerprint
+        // The 70205 fingerprints do not survive a locale table that grew from 4 entries to 11 (70938): every spot ties
+        // and the search picks an arbitrary candidate. The client's own data still has a shape that cannot be faked:
+        //   - a run of 8 locale name pointers in alphabetical order (enUS koKR frFR deDE ...) is the locale table;
+        //   - the record table next to it, entries of 0x18 bytes [name pointer][index u32][flags u32], holds the
+        //     index Ymir reads for the current locale (0 for enUS) - that is locale_index.
+        // Both are found by walking the image once, which works on any build and needs no table.
+        static readonly string[] LocaleNames = { "enUS", "koKR", "frFR", "deDE", "zhCN", "zhTW", "esES", "esMX", "ruRU" };
+
+        public static bool IsLocaleName(GameImage img, long rva, string name)
+        {
+            // a qword read out of the image holds an absolute address, a section offset is an RVA: accept both
+            if (rva > img.Base) rva -= img.Base;
+            if (rva <= 0 || rva >= img.Size) return false;
+            var got = img.Read(rva, name.Length + 1);
+            if (got.Length < name.Length + 1 || got[name.Length] != 0) return false;
+            for (int i = 0; i < name.Length; i++) if (got[i] != (byte)name[i]) return false;
+            return true;
+        }
+
+        // Every run of 8 consecutive qwords that point at the locale names in order, first one wins.
+        public static List<FoundAddress> FindLocaleTables(GameImage img)
+        {
+            var found = new List<FoundAddress>();
+            var data = img.Sections.FirstOrDefault(s => s.Name == ".data");
+            if (data == null) return found;
+            long end = Math.Min(data.Rva + data.Size, img.Size) - 8 * (LocaleNames.Length - 1);
+            for (long rva = data.Rva & ~7L; rva <= end; rva += 8)
+            {
+                bool ok = true;
+                for (int i = 0; i < LocaleNames.Length && ok; i++)
+                    ok = IsLocaleName(img, img.ReadInt64(rva + i * 8), LocaleNames[i]);
+                if (ok) found.Add(new FoundAddress { Key = "locale_table", Rva = rva, Check = CheckState.Ok, Detail = "locale names in order" });
+            }
+            // the table can also live in .rdata (70938: 0x3c02710)
+            var rdata = img.Sections.FirstOrDefault(s => s.Name == ".rdata");
+            if (rdata != null)
+            {
+                long e2 = Math.Min(rdata.Rva + rdata.Size, img.Size) - 8 * (LocaleNames.Length - 1);
+                for (long rva = rdata.Rva & ~7L; rva <= e2; rva += 8)
+                {
+                    bool ok = true;
+                    for (int i = 0; i < LocaleNames.Length && ok; i++)
+                        ok = IsLocaleName(img, img.ReadInt64(rva + i * 8), LocaleNames[i]);
+                    if (ok) found.Add(new FoundAddress { Key = "locale_table", Rva = rva, Check = CheckState.Ok, Detail = "locale names in order" });
+                }
+            }
+            return found;
+        }
+
+        // The locale record table: entries of 0x18 bytes, [qword name pointer][u32 index][u32 flags]. Ymir reads the
+        // u32 right after the enUS record's name pointer. Walk .data for such a record and take that u32.
+        public static FoundAddress FindLocaleIndexByRecords(GameImage img)
+        {
+            var data = img.Sections.FirstOrDefault(s => s.Name == ".data");
+            if (data == null) return null;
+            long end = Math.Min(data.Rva + data.Size, img.Size) - 0x18;
+            for (long rva = data.Rva & ~7L; rva <= end; rva += 8)
+            {
+                if (!IsLocaleName(img, img.ReadInt64(rva), "enUS")) continue;
+                // a record table, not a stray pointer: the next entry must be another locale name
+                long next = rva + 0x18;
+                long nextName = img.ReadInt64(next);
+                bool looksLikeTable = false;
+                foreach (var n in LocaleNames)
+                    if (IsLocaleName(img, nextName, n)) { looksLikeTable = true; break; }
+                if (!looksLikeTable) continue;
+                int index = img.ReadInt32(rva + 8);
+                if (index < 0 || index > 32) continue;
+                return new FoundAddress { Key = "locale_index", Rva = rva + 8, Check = CheckState.Ok, Detail = "locale record table (" + index + ")" };
+            }
+            return null;
+        }
+
         public static Dictionary<string, FoundAddress> FindAll(GameImage img, BuildAddresses near, out int fingerprintBuild)
         {
             var fps = Fingerprints(out fingerprintBuild);
             var result = new Dictionary<string, FoundAddress>();
+
+            // structure first: the locale table and the record table give both addresses without a fingerprint
+            var tables = FindLocaleTables(img);
+            var byRecords = FindLocaleIndexByRecords(img);
+            if (tables.Count > 0)
+            {
+                // with several runs, the one closest to the previous build's table is the live one
+                var table = tables.OrderBy(f => Math.Abs(f.Rva - near.LocaleTable)).First();
+                result["locale_table"] = table;
+                if (byRecords != null) result["locale_index"] = byRecords;
+            }
             foreach (var key in new[] { "locale_table", "locale_index" })
             {
+                if (result.ContainsKey(key)) continue;
                 var f = Slide(img, key, fps[key], Anchor(key, near.Get(key)), 1)[0];
                 Verify(img, f);
                 result[key] = f;

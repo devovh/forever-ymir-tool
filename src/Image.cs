@@ -65,7 +65,7 @@ namespace YmirTool
         public byte[] ReadAbsolute(long address, int count) { return Read(address - Base, count); }
     }
 
-    // The running WowB.exe, read with ReadProcessMemory only (nothing is ever written to the game).
+    // The running client (Forever: Wow.exe, retail: WowB.exe), read with ReadProcessMemory only (nothing is written to the game).
     public sealed class LiveImage : GameImage, IDisposable
     {
         [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
@@ -110,10 +110,27 @@ namespace YmirTool
 
         public void Dispose() { CloseHandle(handle); }
 
+        // The Forever client runs as Wow.exe (_forever_\Wow.exe), retail as WowB.exe - try both. A process whose modules cannot be
+        // read (elevated game, unelevated tool) is skipped instead of failing the search, and the reason is kept in LastError.
+        public static readonly string[] Names = { "Wow", "WowB", "WowClassic", "WowClassicB", "WowT" };
+        public static string LastError;
+
         public static Process FindClient()
         {
-            var list = Process.GetProcessesByName("WowB");
-            return list.Length > 0 ? list[0] : null;
+            LastError = null;
+            bool seen = false;
+            foreach (var name in Names)
+            {
+                foreach (var p in Process.GetProcessesByName(name))
+                {
+                    seen = true;
+                    try { var _ = p.MainModule.BaseAddress; return p; }
+                    catch (Win32Exception ex) { LastError = name + ".exe (PID " + p.Id + "): " + ex.Message; }
+                    catch (InvalidOperationException) { }
+                }
+            }
+            if (!seen) LastError = "no " + string.Join(" / ", Names) + " process found";
+            return null;
         }
     }
 }

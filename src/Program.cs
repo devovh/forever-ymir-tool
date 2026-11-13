@@ -16,12 +16,49 @@ namespace YmirTool
         [STAThread]
         static int Main(string[] args)
         {
+            if (args.Length >= 3 && args[0] == "--session") return SessionCheck(args[1], args[2]);
             if (args.Length >= 2 && args[0] == "--selftest") return SelfTest(args[1], args.Skip(2).ToArray());
             L.Load();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm());
             return 0;
+        }
+
+        // --session <image dump> <sniff.pkt>: find the .data slot whose session key decrypts the sniff (no patterns involved).
+        // Works on a dump taken from the running client, so the answer does not need the game to be logged in right now.
+        static int SessionCheck(string dumpPath, string pktPath)
+        {
+            Console.WriteLine("sniff: " + pktPath);
+            string detail;
+            var samples = PktSamples.Load(pktPath, out detail);
+            Console.WriteLine("  " + detail);
+            if (samples.Count == 0) { Console.WriteLine("no handshake in that sniff"); return 2; }
+
+            Console.WriteLine("image: " + dumpPath);
+            var dumpBytes = File.ReadAllBytes(dumpPath);
+            long imgBase, imgSize;
+            var slots = KeyCheck.SlotsFromBytes(dumpBytes, out imgBase, out imgSize);
+            Console.WriteLine(string.Format("  base 0x{0:x}, size 0x{1:x}", imgBase, imgSize));
+            Console.WriteLine("  .data pointer slots: " + slots.Count);
+
+            int tried = 0;
+            foreach (var slot in slots)
+            {
+                int at;
+                var key = KeyCheck.ReadKeyFromBytes(dumpBytes, slot.Value, 0x40, out at);
+                if (Environment.GetEnvironmentVariable("YMT_DEBUG") != null && tried < 3)
+                    Console.WriteLine(string.Format("  dbg slot 0x{0:x} ptr 0x{1:x} -> key {2}", slot.Key, slot.Value, key == null ? "null" : "ok"));
+                if (key == null) continue;
+                tried++;
+                if (!KeyCheck.Works(key, samples)) continue;
+                Console.WriteLine(string.Format("CONFIRMED: session pointer at image RVA 0x{0:x}, key at +0x{1:x}", slot.Key, at));
+                Console.WriteLine("          key " + BitConverter.ToString(key).Replace("-", "").ToLowerInvariant());
+                return 0;
+            }
+            Console.WriteLine(string.Format("dbg slots={0} tried={1} base=0x{2:x} size=0x{3:x} firstSlot=0x{4:x}->0x{5:x}", slots.Count, tried, imgBase, imgSize, slots.Count > 0 ? slots[0].Key : 0, slots.Count > 0 ? slots[0].Value : 0));
+            Console.WriteLine(string.Format("no working key: {0} candidate(s) tried against {1} packet(s)", tried, samples.Count));
+            return 3;
         }
 
         // args: [70124 dump] [70205 dump] [ymir regedit.exe] [regedit_70235.exe made by patch_ymir.py] [sniff.pkt]
@@ -46,7 +83,7 @@ namespace YmirTool
                                             pair.Item2, f.Key, f.Rva, want.Get(f.Key), f.Score, f.MaxScore, f.RunnerUp, f.Check, f.Detail));
                 }
                 var source = File.ReadAllBytes(files[2]);
-                check(YmirPatcher.Sha256(source) == YmirPatcher.OriginalSha256 && YmirPatcher.CheckSource(source) == null, "Ymir original recognised");
+                check(YmirPatcher.IsOriginal(source) && YmirPatcher.CheckSource(source) == null, "Ymir original recognised");
                 var patched = YmirPatcher.Patch(source, 70235, Finder.Known(70235));
                 var python = File.ReadAllBytes(files[3]);
                 check(patched.SequenceEqual(python), "Ymir for 70235 identical to patch_ymir.py output (" + patched.Length + " bytes)");

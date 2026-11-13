@@ -30,6 +30,8 @@ namespace YmirTool
         ListView addresses;
         int clientBuild;
         Dictionary<string, FoundAddress> found;
+        static readonly string Build = DateTime.Now.ToString("HHmm");   // shows in the title so the running binary is identifiable
+        string keySniff;               // the .pkt a found session address was confirmed against (set by ConfirmSession)
         bool fromKnownBuild;
 
         // 2. record
@@ -59,7 +61,7 @@ namespace YmirTool
 
         public MainForm()
         {
-            Text = "Ymir Tool " + Program.Version;
+            Text = "Ymir Tool " + Program.Version + " build " + Build;
             Size = new Size(1180, 780);
             MinimumSize = new Size(900, 600);
             Font = new Font("Segoe UI", 10f);
@@ -367,9 +369,23 @@ namespace YmirTool
         {
             ymirPath.Text = path;
             string why;
-            try { why = YmirPatcher.CheckSource(File.ReadAllBytes(path)); }
-            catch (Exception ex) { why = ex.Message; }
-            ymirState.Text = why == null ? L.Get("ymir.ok") : L.Get("ymir.bad", why);
+            try
+            {
+                var data = File.ReadAllBytes(path);
+                why = YmirPatcher.CheckSource(data);
+                if (why == null)
+                {
+                    // a copy patched earlier by this tool is accepted too: its own build number is what matters now
+                    int build = YmirPatcher.ReadBuild(data);
+                    var cur = YmirPatcher.ReadCurrent(data);
+                    ymirState.Text = YmirPatcher.IsOriginal(data)
+                        ? L.Get("ymir.ok")
+                        : string.Format("OK: Ymir already patched to build {0} (locale 0x{1:x} table 0x{2:x} session 0x{3:x})",
+                                        build, cur.LocaleIndex, cur.LocaleTable, cur.Session);
+                }
+                else ymirState.Text = L.Get("ymir.bad", why);
+            }
+            catch (Exception ex) { why = ex.Message; ymirState.Text = L.Get("ymir.bad", why); }
             ymirState.ForeColor = why == null ? Good : Bad;
             if (why == null) Settings.Set("ymir", path);
             UpdateButtons();
@@ -390,7 +406,7 @@ namespace YmirTool
                     string version = FileVersionInfo.GetVersionInfo(exe).FileVersion ?? "";
                     clientBuild = int.Parse(version.Split('.').Last());
                 }
-                if (p == null) { clientState.Text = (clientBuild > 0 ? "build " + clientBuild + " · " : "") + L.Get("noclient"); clientState.ForeColor = Dim; }
+                if (p == null) { clientState.Text = (clientBuild > 0 ? "build " + clientBuild + " · " : "") + L.Get("noclient") + (LiveImage.LastError != null ? " [" + LiveImage.LastError + "]" : ""); clientState.ForeColor = Dim; }
                 else { clientState.Text = string.Format("PID {0} · build {1} · {2}", p.Id, clientBuild, exe); clientState.ForeColor = SystemColors.ControlText; }
             }
             catch (Exception ex) { clientState.Text = ex.Message; clientState.ForeColor = Bad; }
@@ -407,11 +423,114 @@ namespace YmirTool
             if (clientBuild != before) UpdateChecklist();
         }
 
+        // Fingerprints only know where things looked right on an older build. When they fail, do what ForeverSniffer does: follow
+        // every .data pointer, read the 40-byte key at +0x48 and keep the one that decrypts a real captured packet (AES-GCM tag
+        // check). A wrong key cannot pass that, so the address is confirmed rather than guessed.
+        bool ConfirmSession(LiveImage img, Dictionary<string, FoundAddress> result)
+        {
+            if (keySniff == null || !File.Exists(keySniff))
+            {
+                keySniff = NewestSniff();
+                if (keySniff == null)
+                {
+                    Log("session key check skipped: no .pkt found");
+                    Log("  looked in: " + string.Join("; ", SniffFolders().ToArray()));
+                    return false;
+                }
+                Log("session key check uses " + keySniff);
+            }
+            List<KeySample> samples;
+            string detail;
+            try { samples = PktSamples.Load(keySniff, out detail); }
+            catch (Exception ex) { Log("sniff unusable for the key check: " + ex.Message); return false; }
+            Log("checking the session key against " + Path.GetFileName(keySniff) + ": " + detail);
+            if (samples.Count == 0) { Log("that sniff holds no handshake (no challenges) - cannot confirm a key with it"); return false; }
+
+            // A known build already has the session slot: check that one first, and if the key there decrypts the
+            // capture the answer is settled - no scanning of tens of thousands of pointers needed.
+            int tried = 0;
+            int build = 0;
+            try { var parts = (img.Version ?? "").Split('.'); int.TryParse(parts[parts.Length - 1], out build); }
+            catch { build = 0; }
+            var known = Finder.Known(build);
+            if (known != null && known.Session != 0)
+            {
+                var at = img.ReadInt64(known.Session);
+                var k0 = KeyCheck.ReadKeyAt(img, at);
+                if (k0 != null && KeyCheck.Works(k0, samples))
+                {
+                    Log(string.Format("session key CONFIRMED at the known slot 0x{0:x} (pointer 0x{1:x}, key at +0x{2:x})",
+                                      known.Session, at, KeyCheck.SessionKeyOffset));
+                    result["session"] = new FoundAddress { Key = "session", Rva = known.Session, Check = CheckState.Ok, Detail = "key decrypts the sniff" };
+                    return true;
+                }
+                Log(string.Format("the known slot 0x{0:x} does not hold a working key in this session; scanning instead", known.Session));
+            }
+            foreach (var slot in Finder.DataPointerSlots(img))
+            {
+                var key = KeyCheck.ReadKeyAt(img, slot.Value);
+                if (key == null) continue;
+                tried++;
+                if (!KeyCheck.Works(key, samples)) continue;
+                Log(string.Format("session key CONFIRMED: pointer at image RVA 0x{0:x}, key at +0x{1:x} - decrypts {2}",
+                                  slot.Key, KeyCheck.SessionKeyOffset, Path.GetFileName(keySniff)));
+                result["session"] = new FoundAddress { Key = "session", Rva = slot.Key, Check = CheckState.Ok, Detail = "key decrypts the sniff" };
+                return true;
+            }
+            Log(string.Format("no .data pointer held a working key ({0} keys tried against {1} packet(s))", tried, samples.Count));
+            return false;
+        }
+
+        // the newest .pkt in the recorder's dumps folder
+        // every place a .pkt can be: the recorder's dumps folder, one next to this tool, and one next to each saved recorder path
+        List<string> SniffFolders()
+        {
+            var dirs = new List<string>();
+            var own = DumpsFolder();
+            if (own != null) dirs.Add(own);
+            dirs.Add(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "dumps"));
+            foreach (var key in new[] { "sniffer", "ymir" })
+            {
+                string saved;
+                try { saved = Settings.Get(key, ""); } catch { continue; }
+                if (string.IsNullOrEmpty(saved)) continue;
+                var parent = Path.GetDirectoryName(saved);
+                if (!string.IsNullOrEmpty(parent)) dirs.Add(Path.Combine(parent, "dumps"));
+            }
+            return dirs;
+        }
+
+        string NewestSniff()
+        {
+            var dirs = SniffFolders();
+
+
+            string best = null;
+            DateTime bestTime = DateTime.MinValue;
+            foreach (var d in dirs)
+            {
+                if (string.IsNullOrEmpty(d) || !Directory.Exists(d)) continue;
+                foreach (var f in Directory.GetFiles(d, "*.pkt"))
+                {
+                    var when = File.GetLastWriteTimeUtc(f);
+                    if (when > bestTime) { bestTime = when; best = f; }
+                }
+            }
+            return best;
+        }
         void UpdateButtons()
         {
             find.Enabled = LiveImage.FindClient() != null;
-            create.Enabled = clientBuild > 0 && clientBuild != YmirPatcher.OriginalBuild && found != null
-                             && found.Values.All(f => f.Check == CheckState.Ok) && ymirState.ForeColor == Good;
+            bool targetOk = false;
+            try
+            {
+                targetOk = clientBuild > 0 && File.Exists(ymirPath.Text)
+                           && YmirPatcher.CheckTarget(File.ReadAllBytes(ymirPath.Text), clientBuild) == null;
+            }
+            catch { targetOk = false; }
+            // a failed search leaves Rva = 0 or a stretch of code: never offer to write those numbers into a copy of Ymir
+            bool foundOk = found != null && found.Values.All(f => f.Check == CheckState.Ok && f.Rva != 0);
+            create.Enabled = targetOk && foundOk && ymirState.ForeColor == Good;
         }
 
         async void FindAddresses()
@@ -433,12 +552,26 @@ namespace YmirTool
                     ShowAddresses();
                     foreach (var f in result.Values)
                         Log(string.Format("{0,-13} 0x{1:x}  {2}/{3} (next best {4})  {5}", f.Key, f.Rva, f.Score, f.MaxScore, f.RunnerUp, f.Detail));
+                    // the patterns failed: confirm the session key against a captured packet instead
+                    FoundAddress sess;
+                    bool sessionOk = result.TryGetValue("session", out sess) && sess.Check == CheckState.Ok;
+                    if (!sessionOk && ConfirmSession(img, result))
+                    {
+                        found = result;
+                        ShowAddresses();
+                        UpdateButtons();
+                    }
                     if (result.Values.All(f => f.Check == CheckState.Ok))
                     {
                         Finder.Learn(img, clientBuild, result);
                         Log(L.Get("learned", clientBuild)); Say(L.Get("learned", clientBuild), Good);
                     }
-                    else { Log(L.Get("notall")); Say(L.Get("notall"), Warn); }
+                    else
+                    {
+                        Log(L.Get("notall"));
+                        Say(L.Get("notall"), Warn);
+                        Log("Create patched Ymir stays off until all three addresses check out (look at the Check column).");
+                    }
                 }
             }
             catch (Exception ex) { Log("ERROR: " + ex.Message); Say(ex.Message, Bad); }
@@ -450,10 +583,23 @@ namespace YmirTool
         {
             addresses.Items.Clear();
             var original = Finder.Known(YmirPatcher.OriginalBuild);
+            // what the chosen Ymir itself holds - the file can already be patched, so these are not always the 70124 numbers
+            BuildAddresses current = null;
+            int ymirBuild = 0;
+            try
+            {
+                if (File.Exists(ymirPath.Text))
+                {
+                    var data = File.ReadAllBytes(ymirPath.Text);
+                    current = YmirPatcher.ReadCurrent(data);
+                    ymirBuild = YmirPatcher.ReadBuild(data);
+                }
+            }
+            catch { }
             foreach (var key in Finder.Keys)
             {
                 var item = new ListViewItem(L.Get("addr." + key));
-                item.SubItems.Add("0x" + original.Get(key).ToString("x"));
+                item.SubItems.Add("0x" + (current != null ? current.Get(key) : original.Get(key)).ToString("x"));
                 FoundAddress f;
                 if (found != null && found.TryGetValue(key, out f))
                 {
@@ -465,7 +611,7 @@ namespace YmirTool
                 addresses.Items.Add(item);
             }
             var build = new ListViewItem("Build");
-            build.SubItems.Add(YmirPatcher.OriginalBuild.ToString());
+            build.SubItems.Add((ymirBuild > 0 ? ymirBuild : YmirPatcher.OriginalBuild).ToString());
             build.SubItems.Add(clientBuild > 0 ? clientBuild.ToString() : "");
             addresses.Items.Add(build);
         }
@@ -476,9 +622,12 @@ namespace YmirTool
             {
                 var a = new BuildAddresses { Build = clientBuild };
                 foreach (var key in Finder.Keys) a.Set(key, found[key].Rva);
+                var source = File.ReadAllBytes(ymirPath.Text);
+                string cannot = YmirPatcher.CheckTarget(source, clientBuild);
+                if (cannot != null) { Log("ERROR: " + cannot); Say(cannot, Bad); return; }
                 var output = YmirPatcher.OutputPath(ymirPath.Text, clientBuild);
                 if (File.Exists(output) && MessageBox.Show(this, L.Get("overwrite", Path.GetFileName(output)), Text, MessageBoxButtons.YesNo) != DialogResult.Yes) return;
-                var patched = YmirPatcher.Patch(File.ReadAllBytes(ymirPath.Text), clientBuild, a);
+                var patched = YmirPatcher.Patch(source, clientBuild, a);
                 File.WriteAllBytes(output, patched);
                 Log(L.Get("written", output, YmirPatcher.Spots.Length)); Say(L.Get("written", output, YmirPatcher.Spots.Length), Good);
                 UpdateChecklist();

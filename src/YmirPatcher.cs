@@ -1,6 +1,10 @@
 // Makes a copy of Ymir (the Forever beta build 70124, regedit.exe) for another client build: the build number in five places and
-// the three WowB.exe addresses (same as classic_re/ymir_patch/patch_ymir.py), and from client 70291 on nine opcode constants. Each patched value sits inside one instruction whose
-// exact bytes are known; a file whose bytes differ anywhere in those instructions is refused. The original is never changed.
+// the three WowB.exe addresses (same as classic_re/ymir_patch/patch_ymir.py), and from client 70291 on nine opcode constants.
+//
+// Re-patch support: a Ymir that was already patched by an earlier version of this tool (any build, e.g. 70862) can be patched
+// again to a newer build. The instruction prologues are identical in every patched copy - only the 4-byte values changed - so
+// only the prologue is checked, and the values currently in the file are read back and shown. Two spots in the build group have
+// been overwritten with NOPs by older patches (0x11a331, 0x11ce45) and carry no build number any more; they are skipped.
 using System;
 using System.IO;
 using System.Linq;
@@ -11,16 +15,24 @@ namespace YmirTool
     public sealed class Spot
     {
         public readonly long FileOffset;
-        public readonly string Kind;            // build, locale_index, locale_table, session
+        public readonly string Kind;            // build, locale_index, locale_table, session, opcode
         public readonly byte[] Original;        // the whole instruction in the 70124 Ymir
         public readonly int ValueAt;            // where the 4-byte value starts in it
         public readonly string Text;
         public readonly uint NewOpcode;         // Kind "opcode": the value for client 70291 and later
+
         public Spot(long fileOffset, string kind, string hex, int valueAt, string text, uint newOpcode = 0)
         {
-            FileOffset = fileOffset; Kind = kind; ValueAt = valueAt; Text = text; NewOpcode = newOpcode;
+            FileOffset = fileOffset; Kind = kind; Text = text; ValueAt = valueAt; NewOpcode = newOpcode;
             Original = Enumerable.Range(0, hex.Length / 2).Select(i => Convert.ToByte(hex.Substring(i * 2, 2), 16)).ToArray();
         }
+
+        /// <summary>The bytes before the value - identical in the original and in every copy this tool ever made.</summary>
+        public byte[] Prologue { get { return Original.Take(ValueAt).ToArray(); } }
+
+        /// <summary>What to patch: the value slot, or the whole instruction for dynamic spots.</summary>
+        public bool HasValue { get { return ValueAt > 0; } }
+        public long ValueOffset { get { return FileOffset + ValueAt; } }
     }
 
     public static class YmirPatcher
@@ -52,21 +64,77 @@ namespace YmirTool
             new Spot(0x11f96b, "opcode", "81FF0C004600", 2, "cmp edi, main group 0x0C", 0x47000C),
         };
 
+        /// <summary>Opcodes were only introduced with client 70291; patching them onto an older build breaks it.</summary>
+        public const int OpcodeBuild = 70291;
+
         public static string Sha256(byte[] data)
         {
             using (var sha = SHA256.Create())
                 return BitConverter.ToString(sha.ComputeHash(data)).Replace("-", "").ToLowerInvariant();
         }
 
-        // null if the file is the Ymir this tool knows, else the reason
+        /// <summary>True for the pristine Ymir (byte-identical to what the tool was built against).</summary>
+        public static bool IsOriginal(byte[] data)
+        {
+            return Sha256(data) == OriginalSha256;
+        }
+
+        /// <summary>null if the file is a Ymir this tool can patch, else the reason it cannot.</summary>
         public static string CheckSource(byte[] data)
+        {
+            if (data.Length < 0x120000) return "file too small";
+            foreach (var s in Spots)
+            {
+                var prologue = s.Prologue;
+                if (s.FileOffset + s.Original.Length > data.Length) return "file too small";
+                // A build spot starts with the opcode (BA / 3D) and then holds the build number. Every patch this tool made put
+                // its own number there, so the value cannot be checked - only the opcode, or the NOPs an older patch left.
+                if (s.Kind == "build")
+                {
+                    byte first = data[s.FileOffset];
+                    if (first != s.Original[0] && first != 0x90)
+                        return string.Format("unexpected bytes at 0x{0:x} ({1})", s.FileOffset, s.Text);
+                    continue;
+                }
+                for (int i = 0; i < prologue.Length; i++)
+                    if (data[s.FileOffset + i] != prologue[i])
+                        return string.Format("unexpected bytes at 0x{0:x} ({1})", s.FileOffset, s.Text);
+            }
+            return null;
+        }
+
+        /// <summary>The addresses currently stored in the file (0 when not present yet).</summary>
+        public static BuildAddresses ReadCurrent(byte[] data)
+        {
+            var a = new BuildAddresses();
+            foreach (var s in Spots)
+            {
+                if (s.Kind == "build" || s.Kind == "opcode") continue;
+                a.Set(s.Kind, BitConverter.ToUInt32(data, (int)s.ValueOffset));
+            }
+            return a;
+        }
+
+        /// <summary>The build number currently stored in the file, 0 when it cannot be read.</summary>
+        public static int ReadBuild(byte[] data)
         {
             foreach (var s in Spots)
             {
-                if (s.FileOffset + s.Original.Length > data.Length) return "file too small";
-                for (int i = 0; i < s.Original.Length; i++)
-                    if (data[s.FileOffset + i] != s.Original[i]) return string.Format("unexpected bytes at 0x{0:x} ({1})", s.FileOffset, s.Text);
+                if (s.Kind != "build") continue;
+                uint v = BitConverter.ToUInt32(data, (int)s.ValueOffset);
+                if (v > 60000 && v < 100000) return (int)v;
             }
+            return 0;
+        }
+
+        /// <summary>Why this file cannot be patched to <paramref name="build"/>, null when it can.</summary>
+        public static string CheckTarget(byte[] data, int build)
+        {
+            int current = ReadBuild(data);
+            if (current == 0) return "cannot read the build number out of this Ymir";
+            if (current > build) return string.Format("this Ymir is already build {0} - can only patch upwards (to a newer client)", current);
+            if (build < OpcodeBuild && current >= OpcodeBuild)
+                return string.Format("this Ymir already has the 70291+ opcode groups and cannot go back to build {0}", build);
             return null;
         }
 
@@ -74,19 +142,25 @@ namespace YmirTool
         {
             string why = CheckSource(source);
             if (why != null) throw new InvalidOperationException(why);
+
+            int current = ReadBuild(source);
             var d = (byte[])source.Clone();
             foreach (var s in Spots)
             {
-                if (s.Kind == "opcode" && build < 70291)
-                    continue;
+                if (s.Kind == "opcode" && build < OpcodeBuild) continue;
+
                 long value = s.Kind == "opcode" ? s.NewOpcode : s.Kind == "build" ? build : a.Get(s.Kind);
-                Array.Copy(BitConverter.GetBytes((uint)value), 0, d, s.FileOffset + s.ValueAt, 4);
+                Array.Copy(BitConverter.GetBytes((uint)value), 0, d, s.ValueOffset, 4);
             }
-            // like patch_ymir.py: the old build number must be gone completely
-            var old = BitConverter.GetBytes((uint)OriginalBuild);
-            for (int i = 0; i + 4 <= d.Length; i++)
-                if (d[i] == old[0] && d[i + 1] == old[1] && d[i + 2] == old[2] && d[i + 3] == old[3])
-                    throw new InvalidOperationException("build 70124 still present at 0x" + i.ToString("x"));
+
+            // like patch_ymir.py: the PREVIOUS build number must be gone completely
+            if (current > 0)
+            {
+                var old = BitConverter.GetBytes((uint)current);
+                for (int i = 0; i + 4 <= d.Length; i++)
+                    if (d[i] == old[0] && d[i + 1] == old[1] && d[i + 2] == old[2] && d[i + 3] == old[3])
+                        throw new InvalidOperationException("build " + current + " still present at 0x" + i.ToString("x"));
+            }
             return d;
         }
 

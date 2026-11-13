@@ -120,6 +120,15 @@ namespace YmirTool
             }
         }
 
+        /// <summary>Bytes from the raw file buffer (e.g. the 12 wire-header bytes before a payload), null when out of range.</summary>
+        public byte[] ReadAt(int offset, int count)
+        {
+            if (offset < 0 || count <= 0 || offset + count > length) return null;
+            var b = new byte[count];
+            Buffer.BlockCopy(buf, offset, b, 0, count);
+            return b;
+        }
+
         public byte[] Payload(PacketInfo p, int max)
         {
             int n = Math.Min(p.Length, max);

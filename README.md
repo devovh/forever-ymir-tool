@@ -63,3 +63,49 @@ While it records, the status line shows the sniff's name and size. Below is the 
 ## License
 
 GPL-3.0, see [LICENSE](LICENSE). Ymir itself is not part of this repository.
+
+## Finding the three addresses on a new build
+
+The fingerprint search in `data/fingerprints.txt` was made from builds 70124–70291. It stops being decisive as soon as
+the client's locale table changes shape: on 70938 the table grew from 4 entries to 11, every spot tied with its runner-up
+(`locale_index 4/46`, `session 3/132`) and the search picked an arbitrary candidate each run. Two of the three addresses
+can be found by **structure** instead, which needs no fingerprint and no table:
+
+**`locale_table`** — the client keeps the locale names in alphabetical order behind a run of qwords. Walk `.data` and
+`.rdata` for 9 consecutive qwords pointing at `enUS koKR frFR deDE zhCN zhTW esES esMX ruRU`, in that order. Nothing
+else in the image has that shape. (`Finder.FindLocaleTables`.)
+
+**`locale_index`** — it is *not* a lone number in `.data`. Next to the names sits a table of records, `0x18` bytes each:
+`[qword name pointer][u32 index][u32 flags]`. Ymir reads the `u32` right after the `enUS` record's name pointer — `0`
+for an English client. Find the record, take `+8`. (`Finder.FindLocaleIndexByRecords`.)
+
+**`session`** — take it from **Forever Sniffer**: on a build it does not know, the sniffer searches the client's memory
+itself and prints the answer, e.g.
+
+```
+session key found: pointer at image RVA 0x4b69948, key at +0x48 (build 70938)
+```
+
+The key lives 40 bytes into the object that slot points at.
+
+### Build 70938 (Forever 1.60.1)
+
+| address | value | how it was confirmed |
+|---|---|---|
+| locale_table | `0x3c02710` | 11 locale pointers in `.rdata`, verified 227/227 |
+| locale_index | `0x483f908` | record table at `0x483f900`, index `0` = enUS |
+| session | `0x4b69948` | Forever Sniffer's own search |
+
+Confirmed on the live client: a patched Ymir printed `Allowed build: 1.60.1.70938`, `Detected locale: enUS`, and wrote
+30 769 packets into a `.pkt` whose header carries build `70938`.
+
+### Offline check
+
+`tools/` has the scripts used to work this out. With a memory dump of the running client (`tools/dump-image.ps1` dumps
+the module image, `tools/dump-heap.ps1` the heap regions around it):
+
+```
+node tools/analyze-dump.js       # locale names, pointer refs, key candidates
+node tools/pkt-stats.js <sniff>  # header, packet count, opcodes of a .pkt
+node tools/find-locale-index2.js # locale record table in a dump
+```
